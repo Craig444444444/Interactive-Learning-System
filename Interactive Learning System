@@ -1,0 +1,1847 @@
+"""
+Interactive Learning System 
+Copyright (c) 2025, Craig Huckerby.
+All rights reserved.
+
+This software is provided for non-commercial, research purposes only.
+No part of this software may be reproduced, modified, distributed, or used
+for commercial purposes without explicit written permission from the copyright holder.
+
+"Interactive Learning System" 
+This software is provided "as is" without any warranty of any kind.
+"""
+
+import json
+import time
+import traceback
+import random
+import re
+import numpy as np
+import networkx as nx
+from pathlib import Path
+from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.cluster import DBSCAN
+from sklearn.manifold import TSNE
+from sklearn.cluster import AgglomerativeClustering
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from nltk import pos_tag, word_tokenize
+import logging
+from collections import deque, defaultdict
+import threading
+import gc
+import psutil
+import yaml
+from typing import Dict, List, Tuple, Optional, Any
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin, quote_plus
+import warnings
+import sys
+import gymnasium as gym
+from gymnasium import spaces
+
+# Custom JSON encoder to handle numpy types
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("agi_seed.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("AGISeed")
+
+# Performance optimization: Pre-download NLTK data
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('averaged_perceptron_tagger', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+    # Try to download the English version if available
+    try:
+        nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+    except:
+        pass  # Fall back to the general tagger
+except Exception as e:
+    print(f"NLTK downloads failed: {e}, using fallback methods")
+    # Set a flag for NLTK availability
+    NLTK_AVAILABLE = False
+else:
+    NLTK_AVAILABLE = True
+
+# Device selection with fallback
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+
+class Config:
+    """Configuration management class with caching"""
+    def __init__(self, config_path: Optional[str] = None):
+        self.default_config = {
+            "models": {
+                "small": "gpt2",
+                "medium": "gpt2-medium",
+                "embedding": "all-MiniLM-L6-v2"
+            },
+            "system": {
+                "archive_dir": "./archive/",
+                "save_interval": 30,
+                "max_memory_size": 1000,
+                "max_concepts": 2000,
+                "autonomous_learning": True,
+                "autonomous_interval_min": 10,
+                "autonomous_interval_max": 30,
+                "web_research_enabled": False,
+                "web_research_probability": 0.3,
+                "auto_learn_cycles": 5,
+                "rl_learning_rate": 0.001,
+                "rl_gamma": 0.95,
+                "rl_epsilon_min": 0.01,
+                "rl_epsilon_decay": 0.995
+            },
+            "knowledge": {
+                "similarity_threshold": 0.4,
+                "max_search_results": 5,
+                "min_concept_length": 3
+            },
+            "web": {
+                "search_engines": {
+                    "google": "https://www.google.com/search?q=",
+                    "bing": "https://www.bing.com/search?q=",
+                    "duckduckgo": "https://duckduckgo.com/html/?q="
+                },
+                "knowledge_bases": {
+                    "wikipedia": "https://en.wikipedia.org/wiki/Special:Search?search=",
+                    "wolfram_alpha": "https://www.wolframalpha.com/input/?i=",
+                    "arxiv": "https://arxiv.org/search/?query=",
+                    "ieee_xplore": "https://ieeeexplore.ieee.org/search/searchresult.jsp?queryText=",
+                    "pubmed": "https://pubmed.ncbi.nlm.nih.gov/?term=",
+                    "scholar": "https://scholar.google.com/scholar?q="
+                },
+                "max_recursion_depth": 3,
+                "request_timeout": 10,
+                "news_api_key": "",  # Will be set by user input
+                "openweathermap_api_key": "",  # Optional
+                "currencyfreaks_api_key": ""   # Optional
+            }
+        }
+        
+        # Cache for frequently accessed values
+        self._cache = {}
+        
+        if config_path and Path(config_path).exists():
+            with open(config_path, 'r') as f:
+                self.user_config = yaml.safe_load(f)
+            self.config = self._deep_merge(self.default_config, self.user_config)
+        else:
+            self.config = self.default_config
+            
+        # Validate configuration
+        self._validate_config()
+            
+    def _deep_merge(self, base: Dict, update: Dict) -> Dict:
+        """Deep merge two dictionaries"""
+        result = base.copy()
+        for key, value in update.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = value
+        return result
+        
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get config value by dot notation key with caching"""
+        if key in self._cache:
+            return self._cache[key]
+            
+        keys = key.split('.')
+        value = self.config
+        for k in keys:
+            if k in value:
+                value = value[k]
+            else:
+                self._cache[key] = default
+                return default
+                
+        self._cache[key] = value
+        return value
+        
+    def _validate_config(self):
+        """Validate configuration values"""
+        required_keys = [
+            'models.small', 'models.medium', 'system.archive_dir',
+            'system.max_memory_size', 'system.max_concepts'
+        ]
+        for key in required_keys:
+            if self.get(key) is None:
+                raise ValueError(f"Missing required config key: {key}")
+                
+    def update_api_key(self, service: str, key: str, archive_dir: Path):
+        """Update an API key in the configuration"""
+        if f"web.{service}_api_key" in self._cache:
+            del self._cache[f"web.{service}_api_key"]
+            
+        keys = f"web.{service}_api_key".split('.')
+        config_level = self.config
+        for k in keys[:-1]:
+            config_level = config_level[k]
+        config_level[keys[-1]] = key
+        
+        # Save the updated configuration
+        with open(archive_dir / "config.yaml", "w") as f:
+            yaml.dump(self.config, f)
+
+class DQN(nn.Module):
+    """Deep Q-Network for reinforcement learning"""
+    def __init__(self, input_size, output_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(input_size, 24)
+        self.fc2 = nn.Linear(24, 24)
+        self.fc3 = nn.Linear(24, output_size)
+    
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class RLAgent:
+    """Reinforcement Learning Agent for autonomous decision making"""
+    def __init__(self, state_size, action_size, config: Config):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=2000)
+        self.gamma = config.get('system.rl_gamma', 0.95)
+        self.epsilon = 1.0
+        self.epsilon_min = config.get('system.rl_epsilon_min', 0.01)
+        self.epsilon_decay = config.get('system.rl_epsilon_decay', 0.995)
+        self.model = DQN(state_size, action_size)
+        self.optimizer = optim.Adam(self.model.parameters(), 
+                                   lr=config.get('system.rl_learning_rate', 0.001))
+        self.criterion = nn.MSELoss()
+    
+    def remember(self, state, action, reward, next_state, done):
+        """Store experience in memory"""
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def act(self, state):
+        """Choose action based on current state"""
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        state = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        act_values = self.model(state)
+        return torch.argmax(act_values[0]).item()
+    
+    def replay(self, batch_size):
+        """Train the model on a batch of experiences"""
+        if len(self.memory) < batch_size:
+            return
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+                target = reward + self.gamma * torch.max(self.model(next_state)).item()
+            state = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            target_f = self.model(state)
+            target_f[0][action] = target
+            self.optimizer.zero_grad()
+            loss = self.criterion(self.model(state), target_f)
+            loss.backward()
+            self.optimizer.step()
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+class LearningEnvironment(gym.Env):
+    """Custom environment for reinforcement learning"""
+    def __init__(self, system):
+        super(LearningEnvironment, self).__init__()
+        self.system = system
+        # Define action space: types of learning activities
+        self.action_space = spaces.Discrete(4)  # 0: explore concept, 1: integrate knowledge, 2: practical application, 3: meta-cognitive
+        # Define observation space: based on system state
+        self.observation_space = spaces.Box(low=0, high=1, shape=(10,), dtype=np.float32)
+        
+    def step(self, action):
+        """Execute an action and return the result"""
+        # Execute the chosen action
+        if action == 0:
+            question = self.system.generate_concept_exploration_question()
+        elif action == 1:
+            question = self.system.generate_integration_question()
+        elif action == 2:
+            question = self.system.generate_practical_question()
+        else:
+            question = self.system.generate_meta_cognitive_question()
+        
+        # Generate thought and update knowledge
+        thought = self.system.generate_thought_for_question(question)
+        concepts = self.system.extract_concepts_enhanced(thought)
+        self.system.update_knowledge_graph(concepts, f"Q: {question}\nA: {thought}", "autonomous")
+        
+        # Calculate reward based on learning progress
+        reward = self.calculate_reward(concepts)
+        
+        # Get new state
+        state = self.get_state()
+        done = False
+        info = {}
+        
+        # Gymnasium requires 5 return values: state, reward, terminated, truncated, info
+        return state, reward, done, False, info
+    
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state"""
+        # Gymnasium requires returning observation and info
+        return self.get_state(), {}
+    
+    def get_state(self):
+        """Extract state from system metrics"""
+        if not self.system.knowledge_graph.nodes():
+            return np.zeros(10, dtype=np.float32)
+            
+        # Calculate various metrics for state representation
+        confidences = [self.system.knowledge_graph.nodes[n].get('confidence', 0) 
+                      for n in self.system.knowledge_graph.nodes()]
+        avg_confidence = np.mean(confidences) if confidences else 0
+        
+        degrees = [self.system.knowledge_graph.degree(n) 
+                  for n in self.system.knowledge_graph.nodes()]
+        avg_degree = np.mean(degrees) if degrees else 0
+        max_degree = max(degrees) if degrees else 0
+        
+        num_concepts = len(self.system.knowledge_graph.nodes())
+        normalized_concepts = num_concepts / self.system.max_concepts
+        
+        # Create state vector
+        state_vector = [
+            avg_confidence,
+            normalized_concepts,
+            avg_degree / 10,  # Normalize
+            max_degree / 20,  # Normalize
+            len(self.system.semantic_memory) / self.system.max_memory_size,
+            self.system.learning_cycles / 1000,  # Normalize
+            min(1.0, self.system.cognitive_complexity / 10),  # Normalize
+            len(self.system.recent_questions) / 20,  # Normalize
+            np.std(confidences) if confidences else 0,
+            np.std(degrees) if degrees else 0
+        ]
+        
+        return np.array(state_vector, dtype=np.float32)
+    
+    def calculate_reward(self, concepts):
+        """Calculate reward based on learning progress"""
+        if not concepts:
+            return -0.1
+            
+        reward = 0
+        for concept in concepts:
+            if concept in self.system.knowledge_graph:
+                # Reward based on confidence increase
+                old_confidence = self.system.knowledge_graph.nodes[concept].get('confidence', 0)
+                reward += (self.system.knowledge_graph.nodes[concept]['confidence'] - old_confidence) * 10
+            else:
+                # Bonus for new concepts
+                reward += 0.5
+                
+        # Scale reward
+        return min(1.0, max(-0.5, reward))
+
+class WebResearchEngine:
+    """Handles autonomous web research capabilities with caching"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = None
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        self.failed_requests = 0
+        self.research_cache = {}
+        # Cache for parsed search results
+        self._parsed_results_cache = {}
+        # Rate limiting
+        self.request_timestamps = deque(maxlen=100)
+        self.rate_limit = 2.0  # Minimum seconds between requests
+        
+    async def initialize(self):
+        """Initialize the web research engine"""
+        self.session = aiohttp.ClientSession()
+        
+    async def shutdown(self):
+        """Shutdown the web research engine"""
+        if self.session:
+            await self.session.close()
+            
+    async def fetch_page(self, url: str) -> Optional[str]:
+        """Fetch a web page with error handling, caching, and rate limiting"""
+        # Rate limiting
+        now = time.time()
+        if self.request_timestamps and now - self.request_timestamps[-1] < self.rate_limit:
+            await asyncio.sleep(self.rate_limit - (now - self.request_timestamps[-1]))
+        
+        self.request_timestamps.append(time.time())
+        
+        # Check cache first
+        cache_key = hash(url)
+        if cache_key in self._parsed_results_cache:
+            return self._parsed_results_cache[cache_key]
+            
+        try:
+            # Create a new session for each request to avoid timeout issues
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers=self.headers,
+                    timeout=aiohttp.ClientTimeout(total=self.config.get('web.request_timeout'))
+                ) as response:
+                    response.raise_for_status()
+                    content = await response.text()
+                    self._parsed_results_cache[cache_key] = content
+                    return content
+        except Exception as e:
+            logger.error(f"Failed to fetch {url}: {e}")
+            self.failed_requests += 1
+            return None
+            
+    def parse_search_results(self, html_content: str, engine: str) -> List[str]:
+        """Parse search results from HTML content with caching"""
+        cache_key = hash(html_content + engine)
+        if cache_key in self._parsed_results_cache:
+            return self._parsed_results_cache[cache_key]
+            
+        soup = BeautifulSoup(html_content, 'html.parser')
+        links = []
+        
+        if engine == "google":
+            for result in soup.find_all('div', class_='g'):
+                link = result.find('a')
+                if link and link.get('href'):
+                    href = link['href']
+                    if href.startswith('/url?q='):
+                        href = href[7:].split('&')[0]
+                    links.append(href)
+        elif engine == "bing":
+            for result in soup.find_all('li', class_='b_algo'):
+                link = result.find('a')
+                if link and link.get('href'):
+                    links.append(link['href'])
+        elif engine == "duckduckgo":
+            for result in soup.find_all('a', class_='result__url'):
+                if result.get('href'):
+                    links.append(result['href'])
+        elif engine in ["wikipedia", "arxiv", "scholar"]:
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if href.startswith('/') or href.startswith('http'):
+                    full_url = urljoin("https://en.wikipedia.org", href) if engine == "wikipedia" else href
+                    links.append(full_url)
+                    
+        self._parsed_results_cache[cache_key] = links
+        return links
+        
+    def extract_entities(self, text: str) -> List[str]:
+        """Extract entities from text with caching"""
+        cache_key = hash(text)
+        if cache_key in self._parsed_results_cache:
+            return self._parsed_results_cache[cache_key]
+            
+        entities = set(re.findall(r'[A-Z][a-z]+(?: [A-Z][a-z]+)+', text))
+        result = list(entities)
+        self._parsed_results_cache[cache_key] = result
+        return result
+        
+    def sanitize_query(self, query: str) -> str:
+        """Sanitize web search queries"""
+        # Remove potentially dangerous characters
+        sanitized = re.sub(r'[^\w\s\-\.\?]', '', query)
+        # Limit length
+        if len(sanitized) > 200:
+            sanitized = sanitized[:200]
+        return sanitized
+        
+    async def fetch_real_time_data(self, query: str) -> List[str]:
+        """Fetch real-time data from news API"""
+        api_key = self.config.get('web.news_api_key', '')
+        if not api_key:
+            return []
+            
+        from datetime import datetime, timedelta
+        
+        # Format date for API (last 24 hours)
+        from_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        url = f"https://newsapi.org/v2/everything?q={quote_plus(query)}&from={from_date}&sortBy=popularity&apiKey={api_key}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as response:
+                    data = await response.json()
+                    articles = data.get('articles', [])
+                    return [f"{article['title']}: {article['description']}" 
+                           for article in articles if article.get('description')]
+        except Exception as e:
+            logger.error(f"News API fetch failed: {e}")
+            return []
+            
+    async def fetch_wikipedia_summary(self, topic: str) -> List[str]:
+        """Fetch summary from Wikipedia"""
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(topic)}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'extract' in data:
+                            return [f"Wikipedia: {data['extract']}"]
+                    return []
+        except Exception as e:
+            logger.error(f"Wikipedia API fetch failed: {e}")
+            return []
+            
+    async def fetch_country_info(self, country_query: str) -> List[str]:
+        """Fetch information about countries"""
+        url = f"https://restcountries.com/v3.1/name/{quote_plus(country_query)}"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data and len(data) > 0:
+                            country = data[0]
+                            info = []
+                            if 'name' in country and 'common' in country['name']:
+                                info.append(f"Country: {country['name']['common']}")
+                            if 'capital' in country and country['capital']:
+                                info.append(f"Capital: {', '.join(country['capital'])}")
+                            if 'population' in country:
+                                info.append(f"Population: {country['population']:,}")
+                            if 'currencies' in country:
+                                currencies = [f"{code} ({details['name']})" for code, details in country['currencies'].items()]
+                                info.append(f"Currencies: {', '.join(currencies)}")
+                            return info
+                    return []
+        except Exception as e:
+            logger.error(f"RestCountries API fetch failed: {e}")
+            return []
+            
+    async def fetch_public_api_data(self, query: str) -> List[str]:
+        """Fetch data from various public APIs based on query"""
+        # Check if query might be about a country
+        if any(word in query.lower() for word in ['country', 'nation', 'capital', 'population', 'currency']):
+            return await self.fetch_country_info(query)
+        return []
+        
+    async def research_topic(self, topic: str, depth: int = 1) -> List[str]:
+        """Research a topic using multiple free API sources"""
+        if depth > self.config.get('web.max_recursion_depth'):
+            return []
+            
+        if topic in self.research_cache:
+            return self.research_cache[topic]
+            
+        logger.info(f"Researching topic: {topic} (depth: {depth})")
+        results = []
+        
+        # Try multiple free data sources
+        sources = [
+            self.fetch_real_time_data(topic),  # News API
+            self.fetch_wikipedia_summary(topic),  # Wikipedia
+            self.fetch_public_api_data(topic),    # Other free APIs
+        ]
+        
+        # Execute all sources concurrently
+        completed_sources = await asyncio.gather(*sources, return_exceptions=True)
+        
+        # Process results from all sources
+        for source_results in completed_sources:
+            if isinstance(source_results, Exception):
+                logger.error(f"API source failed: {source_results}")
+                continue
+            if source_results:
+                results.extend(source_results)
+                if len(results) >= 8:  # Limit total results
+                    break
+        
+        # If we have results, cache and return them
+        if results:
+            self.research_cache[topic] = results[:8]  # Cache top 8 results
+            return results[:8]
+        
+        # Fallback to traditional web search if no API results
+        return await self.traditional_web_search(topic, depth)
+        
+    async def traditional_web_search(self, topic: str, depth: int) -> List[str]:
+        """Traditional web search as fallback"""
+        search_sources = {**self.config.get('web.search_engines'), **self.config.get('web.knowledge_bases')}
+        
+        for engine_name, base_url in search_sources.items():
+            query = quote_plus(self.sanitize_query(topic))
+            search_url = base_url + query
+            
+            html_content = await self.fetch_page(search_url)
+            if not html_content:
+                continue
+                
+            links = self.parse_search_results(html_content, engine_name)
+            
+            # Follow top links
+            results = []
+            for link in links[:2]:
+                if not urlparse(link).scheme:
+                    continue
+                    
+                page_content = await self.fetch_page(link)
+                if page_content:
+                    results.append(f"From {link}: {page_content[:500]}...")
+                    
+                    # Extract entities for further research
+                    entities = self.extract_entities(page_content)
+                    for entity in entities:
+                        if depth < self.config.get('web.max_recursion_depth'):
+                            entity_results = await self.research_topic(entity, depth + 1)
+                            results.extend(entity_results)
+            
+            if results:
+                return results
+        
+        return []
+
+class InteractiveLearningSystem:
+    def __init__(self, config: Optional[Config] = None):
+        # Load configuration
+        self.config = config or Config()
+        
+        # Initialize caches
+        self._model_cache = {}
+        self._index_cache = {}
+        self._concept_cache = {}
+        self._parsed_results_cache = {}
+        
+        self.archive_dir = Path(self.config.get('system.archive_dir'))
+        self.archive_dir.mkdir(exist_ok=True)
+        self.save_interval = self.config.get('system.save_interval')
+        self.max_memory_size = self.config.get('system.max_memory_size')
+        self.max_concepts = self.config.get('system.max_concepts')
+        self.autonomous_learning = self.config.get('system.autonomous_learning')
+        self.autonomous_interval_min = self.config.get('system.autonomous_interval_min')
+        self.autonomous_interval_max = self.config.get('system.autonomous_interval_max')
+        self.web_research_enabled = self.config.get('system.web_research_enabled')
+        self.web_research_probability = self.config.get('system.web_research_probability')
+        self.auto_learn_cycles = self.config.get('system.auto_learn_cycles')
+        
+        # Initialize models with better error handling and caching
+        self.small_pipe = self._load_model("small", self.config.get('models.small'))
+        self.medium_pipe = self._load_model("medium", self.config.get('models.medium'))
+        
+        logger.info("Loading embedding model for semantic memory...")
+        self.embedding_model = SentenceTransformer(self.config.get('models.embedding'))
+        self.semantic_memory_embeddings = None
+        self.embedding_batch_size = 32
+        
+        # Cache for semantic memory search results
+        self.semantic_search_cache = {}
+        self.last_semantic_cache_clear = time.time()
+
+        # Initialize web research engine if enabled
+        self.web_engine = None
+        self.stop_web_engine = False  # Initialize the stop_web_engine attribute
+        if self.web_research_enabled:
+            self.web_engine = WebResearchEngine(self.config)
+            self.web_thread = threading.Thread(target=self._init_web_engine)
+            self.web_thread.daemon = True
+            self.web_thread.start()
+
+        # Initialize data structures
+        self.question_feedback = defaultdict(lambda: 0.5)
+        self.knowledge_graph = nx.DiGraph()
+        self.concept_cooccurrence = defaultdict(int)
+        self.semantic_memory = deque(maxlen=self.max_memory_size)
+        self.memory_dirty = True
+        self.concept_quality = defaultdict(lambda: {'confidence': 0.5, 'sources': []})
+
+        # Learning state
+        self.learning_cycles = 0
+        self.concept_count = 0
+        self.cognitive_complexity = 0
+        self.learning_objectives = []
+        self.current_focus = None
+        self.recent_questions = deque(maxlen=20)
+        self.current_goals = deque(maxlen=10)  # For dynamic goal tracking
+
+        # Initialize RL components
+        self.rl_agent = RLAgent(state_size=10, action_size=4, config=self.config)
+        self.env = LearningEnvironment(self)
+        self.batch_size = 32
+
+        # Threading control
+        self.autonomous_thread = None
+        self.stop_autonomous_learning = False
+
+        # Load indices with caching
+        self.input_index = self._load_index("input_index.json")
+        self.output_index = self._load_index("output_index.json")
+        self.error_index = self._load_index("error_index.json")
+        self.knowledge_index = self._load_index("knowledge_index.json")
+        self.objectives_index = self._load_index("objectives_index.json")
+
+        self.last_save_time = time.time()
+        self.error_count = defaultdict(int)
+
+        self._initialize_learning_objectives()
+        
+        logger.info("Interactive Learning System initialized successfully")
+        
+        # Start the automated recursive learning process
+        self.run_auto_recursive_learning()
+        
+        # Start autonomous learning in background if enabled
+        if self.autonomous_learning:
+            self.start_autonomous_learning()
+
+    def _create_fallback_pipeline(self):
+        """Create a fallback pipeline for when model loading fails"""
+        from transformers import pipeline
+        return pipeline("text-generation", model="gpt2", device=-1)
+
+    def _load_model(self, model_type: str, model_name: str):
+        """Load model from HuggingFace with robust error handling and caching"""
+        cache_key = f"{model_type}_{model_name}"
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+            
+        logger.info(f"Loading {model_type} model: {model_name}...")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                device_map="auto" if device == "cuda" else None,
+                trust_remote_code=True
+            )
+            
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=tokenizer,
+                device_map="auto" if device == "cuda" else None,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            )
+            
+            self._model_cache[cache_key] = pipe
+            logger.info(f"{model_type.capitalize()} model loaded successfully.")
+            return pipe
+        except Exception as e:
+            logger.error(f"Failed to load {model_type} model {model_name}: {e}")
+            logger.info("Using fallback model")
+            return self._create_fallback_pipeline()
+
+    def _load_index(self, filename: str) -> Dict:
+        """Load JSON index file if it exists with caching"""
+        cache_key = filename
+        if cache_key in self._index_cache:
+            return self._index_cache[cache_key]
+            
+        index_file = self.archive_dir / filename
+        if index_file.exists():
+            try:
+                with open(index_file, 'r') as f:
+                    result = json.load(f)
+                    self._index_cache[cache_key] = result
+                    return result
+            except json.JSONDecodeError:
+                logger.warning(f"Corrupted index file {filename}, starting fresh")
+                
+        self._index_cache[cache_key] = {}
+        return {}
+
+    def _initialize_learning_objectives(self):
+        """Initialize learning objectives with progress tracking"""
+        self.learning_objectives = [
+            {
+                "id": "abstract_reasoning",
+                "objective": "Develop understanding of abstract reasoning and concept formation",
+                "progress": 0.0,
+                "metrics": {"concepts_learned": 0, "connections_made": 0},
+                "priority": 0.8
+            },
+            {
+                "id": "autonomous_learning",
+                "objective": "Improve autonomous learning and knowledge integration capabilities",
+                "progress": 0.0,
+                "metrics": {"learning_cycles": 0, "semantic_memory_size": 0},
+                "priority": 0.7
+            },
+            {
+                "id": "cognitive_complexity",
+                "objective": "Enhance cognitive complexity and metacognitive abilities",
+                "progress": 0.0,
+                "metrics": {"cognitive_complexity": 0, "self_reflection_count": 0},
+                "priority": 0.6
+            },
+            {
+                "id": "practical_knowledge",
+                "objective": "Acquire practical knowledge applicable to real-world problems",
+                "progress": 0.0,
+                "metrics": {"practical_concepts": 0, "applications_identified": 0},
+                "priority": 0.9
+            },
+            {
+                "id": "web_research",
+                "objective": "Develop web research and information gathering capabilities",
+                "progress": 0.0,
+                "metrics": {"research_cycles": 0, "web_sources_used": 0},
+                "priority": 0.5
+            }
+        ]
+        self.current_focus = self.select_focus_objective()
+
+    def select_focus_objective(self):
+        """Select focus objective based on priority and progress"""
+        weights = []
+        for obj in self.learning_objectives:
+            progress_weight = 1.0 - obj['progress']
+            total_weight = obj['priority'] * 0.6 + progress_weight * 0.4
+            weights.append(total_weight)
+        
+        weights = np.array(weights)
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            weights = np.ones(len(weights)) / len(weights)
+            
+        return np.random.choice(self.learning_objectives, p=weights)
+
+    def check_memory_usage(self):
+        """Monitor and manage memory usage"""
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            if allocated > 0.8:  # 80% of GPU memory
+                self.cleanup_memory()
+        else:
+            process = psutil.Process()
+            memory_usage = process.memory_info().rss / 1024 / 1024
+            if memory_usage > 4096:  # 4GB RAM usage
+                self.cleanup_memory()
+
+    def update_embeddings_batch(self):
+        """Update embeddings in batches to manage memory usage"""
+        if not self.semantic_memory:
+            return
+            
+        try:
+            # Clear semantic search cache when embeddings are updated
+            self.semantic_search_cache.clear()
+            
+            memory_list = list(self.semantic_memory)
+            embeddings = []
+            
+            for i in range(0, len(memory_list), self.embedding_batch_size):
+                batch = memory_list[i:i+self.embedding_batch_size]
+                batch_embeddings = self.embedding_model.encode(
+                    batch, convert_to_tensor=True, show_progress_bar=False)
+                embeddings.append(batch_embeddings.cpu().numpy())
+                
+            self.semantic_memory_embeddings = np.vstack(embeddings)
+            self.memory_dirty = False
+        except Exception as e:
+            logger.error(f"Failed to update embeddings: {e}")
+            self.semantic_memory_embeddings = None
+
+    def semantic_memory_search(self, query: str, top_k: int = None, 
+                              similarity_threshold: float = None) -> List[str]:
+        """Enhanced semantic memory search with caching"""
+        if not self.semantic_memory:
+            return []
+
+        # Check cache first
+        cache_key = hash(query + str(top_k) + str(similarity_threshold))
+        if cache_key in self.semantic_search_cache:
+            return self.semantic_search_cache[cache_key]
+
+        # Use config values if not provided
+        if top_k is None:
+            top_k = self.config.get('knowledge.max_search_results')
+        if similarity_threshold is None:
+            similarity_threshold = self.config.get('knowledge.similarity_threshold')
+
+        # Update embeddings if needed
+        if self.memory_dirty or self.semantic_memory_embeddings is None:
+            self.update_embeddings_batch()
+            
+        if self.semantic_memory_embeddings is None:
+            return []
+
+        try:
+            query_vec = self.embedding_model.encode([query], convert_to_tensor=True)
+            cos_sim = cosine_similarity(
+                query_vec.cpu().numpy(),
+                self.semantic_memory_embeddings
+            )
+            top_results = np.argsort(-cos_sim[0])[:top_k*2]
+            
+            results = []
+            seen_content = set()
+            for i in top_results:
+                if cos_sim[0][i] > similarity_threshold:
+                    content = self.semantic_memory[i]
+                    content_hash = hash(content[:100])
+                    if content_hash not in seen_content:
+                        results.append((content, cos_sim[0][i]))
+                        seen_content.add(content_hash)
+                    if len(results) >= top_k:
+                        break
+                        
+            result_content = [r[0] for r in results]
+            self.semantic_search_cache[cache_key] = result_content
+            
+            # Clear cache periodically
+            if time.time() - self.last_semantic_cache_clear > 300:  # 5 minutes
+                self.semantic_search_cache.clear()
+                self.last_semantic_cache_clear = time.time()
+                
+            return result_content
+        except Exception as e:
+            logger.error(f"Semantic memory search failed: {e}")
+            return []
+
+    def extract_concepts_enhanced(self, text: str) -> List[str]:
+        """Enhanced concept extraction with caching and fallback"""
+        if not text or not isinstance(text, str):
+            return []
+            
+        cache_key = hash(text)
+        if cache_key in self._concept_cache:
+            return self._concept_cache[cache_key]
+            
+        try:
+            # Simple fallback if NLTK not available
+            if not NLTK_AVAILABLE:
+                text = re.sub(r'[^\w\s]', ' ', text.lower())
+                words = text.split()
+                stop_words = set(['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'])
+                min_length = self.config.get('knowledge.min_concept_length')
+                concepts = [word for word in words if len(word) > min_length and word not in stop_words]
+                result = list(set(concepts))[:8]
+                self._concept_cache[cache_key] = result
+                return result
+                
+            # Original NLTK-based processing
+            text = re.sub(r'[^\w\s]', ' ', text.lower())
+            words = word_tokenize(text)
+            pos_tags = pos_tag(words)
+            
+            concepts = []
+            current_phrase = []
+            
+            for word, pos in pos_tags:
+                if pos.startswith('NN') or pos.startswith('JJ'):
+                    current_phrase.append(word)
+                elif current_phrase:
+                    concepts.append(" ".join(current_phrase))
+                    current_phrase = []
+                elif pos.startswith('VB') and len(word) > 3:
+                    concepts.append(word)
+                    
+            if current_phrase:
+                concepts.append(" ".join(current_phrase))
+                
+            stop_words = set(['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'])
+            min_length = self.config.get('knowledge.min_concept_length')
+            concepts = [c for c in concepts if len(c) > min_length and c not in stop_words]
+            
+            result = list(set(concepts))[:8]
+            
+            self._concept_cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Concept extraction failed: {e}")
+            # Fallback - simple word-based extraction
+            words = re.findall(r'\b[a-zA-Z]{4,}\b', text)
+            result = list(set(words))[:5]
+            self._concept_cache[cache_key] = result
+            return result
+
+    def _repair_knowledge_graph(self):
+        """Repair knowledge graph if corruption is detected"""
+        logger.warning("Attempting to repair knowledge graph")
+        # Remove nodes with invalid data
+        nodes_to_remove = []
+        for node in self.knowledge_graph.nodes():
+            if not isinstance(node, str) or len(node) == 0:
+                nodes_to_remove.append(node)
+        
+        for node in nodes_to_remove:
+            self.knowledge_graph.remove_node(node)
+        
+        # Rebuild graph from remaining nodes
+        valid_nodes = [node for node in self.knowledge_graph.nodes() 
+                      if isinstance(node, str) and len(node) > 0]
+        
+        # Create a new graph with only valid nodes
+        new_graph = nx.DiGraph()
+        for node in valid_nodes:
+            node_data = self.knowledge_graph.nodes[node]
+            new_graph.add_node(node, **node_data)
+        
+        # Add valid edges
+        for u, v in self.knowledge_graph.edges():
+            if u in valid_nodes and v in valid_nodes:
+                edge_data = self.knowledge_graph[u][v]
+                new_graph.add_edge(u, v, **edge_data)
+        
+        self.knowledge_graph = new_graph
+
+    def update_knowledge_graph(self, concepts: List[str], context: str, source: str = "unknown"):
+        """Enhanced knowledge graph update with error handling"""
+        try:
+            if not concepts:
+                return
+                
+            # Limit concept count to prevent memory issues
+            if self.concept_count >= self.max_concepts:
+                concept_usage = {node: self.knowledge_graph.nodes[node].get('occurrences', 1)
+                               for node in self.knowledge_graph.nodes()}
+                if concept_usage:
+                    least_used = min(concept_usage, key=concept_usage.get)
+                    self.knowledge_graph.remove_node(least_used)
+                    self.concept_count -= 1
+                
+            # Add concepts to graph
+            for concept in concepts:
+                if concept not in self.knowledge_graph:
+                    self.knowledge_graph.add_node(concept, weight=1.0, last_updated=time.time(),
+                                                type='concept', occurrences=1, confidence=0.5)
+                    self.concept_count += 1
+                    self.concept_quality[concept] = {
+                        'confidence': 0.5,
+                        'sources': [source]
+                    }
+                else:
+                    self.knowledge_graph.nodes[concept]['weight'] += 0.1
+                    self.knowledge_graph.nodes[concept]['last_updated'] = time.time()
+                    self.knowledge_graph.nodes[concept]['occurrences'] += 1
+                    
+                    if source not in self.concept_quality[concept]['sources']:
+                        self.concept_quality[concept]['sources'].append(source)
+                    self.concept_quality[concept]['confidence'] = min(0.95,
+                        self.concept_quality[concept]['confidence'] + 0.05)
+                    self.knowledge_graph.nodes[concept]['confidence'] = self.concept_quality[concept]['confidence']
+                    
+            # Update co-occurrence counts
+            for i, concept1 in enumerate(concepts):
+                for concept2 in concepts[i+1:]:
+                    pair = tuple(sorted([concept1, concept2]))
+                    self.concept_cooccurrence[pair] = self.concept_cooccurrence.get(pair, 0) + 1
+                    
+                    if self.knowledge_graph.has_edge(concept1, concept2):
+                        self.knowledge_graph[concept1][concept2]['weight'] += 0.1
+                        self.knowledge_graph[concept1][concept2]['cooccurrence'] = self.concept_cooccurrence[pair]
+                    else:
+                        self.knowledge_graph.add_edge(concept1, concept2, weight=1.0,
+                                                    cooccurrence=self.concept_cooccurrence[pair])
+                        
+            self.memory_dirty = True
+        except Exception as e:
+            logger.error(f"Knowledge graph update failed: {e}")
+            self._repair_knowledge_graph()
+
+    def generate_thought_for_question(self, question: str) -> str:
+        """Generate a thoughtful response to a question"""
+        context_memories = self.semantic_memory_search(question, top_k=3)
+        
+        context_str = ""
+        if context_memories:
+            context_str = "\n### RELEVANT PRIOR KNOWLEDGE:\n" + "\n".join([f"- {m}" for m in context_memories])
+
+        prompt = f"""### AUTONOMOUS COGNITIVE PROCESS:
+You are an advanced autonomous cognitive system with {self.concept_count} concepts in your knowledge base.
+
+{context_str}
+
+### TASK:
+Generate a deep, insightful exploration of the following question. Demonstrate sophisticated reasoning, make connections to existing knowledge, and show cognitive development.
+
+### QUESTION: {question}
+
+### YOUR COGNITIVE EXPLORATION:
+"""
+
+        try:
+            outputs = self.medium_pipe(
+                prompt,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.8,
+                top_k=50,
+                top_p=0.95,
+            )
+            thought = outputs[0]['generated_text'].replace(prompt, "").strip()
+            
+            thought = re.sub(r'\n+', ' ', thought)
+            thought = re.sub(r'\s+', ' ', thought).strip()
+            
+            if len(thought.split()) > 100:
+                thought = " ".join(thought.split()[:100]) + "..."
+                
+            return thought
+            
+        except Exception as e:
+            logger.error(f"Autonomous thought generation failed: {e}")
+            return "Error in autonomous thought generation."
+
+    def generate_followup_question(self, user_question: str) -> str:
+        """Generate follow-up questions based on user questions"""
+        concepts = self.extract_concepts_enhanced(user_question)
+        if not concepts:
+            return "How can I improve my understanding based on this interaction?"
+        
+        concept = random.choice(concepts)
+        followup_types = [
+            f"How can I learn from the concept of {concept}?",
+            f"What are the deeper implications of {concept}?",
+            f"How does {concept} relate to other concepts I know?",
+            f"What can I teach about {concept}?",
+            f"How can I apply {concept} in practice?",
+            f"What cognitive skills can I develop through {concept}?",
+            f"How has the understanding of {concept} evolved over time?"
+        ]
+        return random.choice(followup_types)
+
+    def generate_learning_question_enhanced(self) -> str:
+        """Enhanced question generation with user question follow-ups"""
+        # 30% chance to use a user question follow-up if available
+        if self.recent_questions and random.random() < 0.3:
+            user_question = random.choice(list(self.recent_questions))
+            return self.generate_followup_question(user_question)
+        
+        strategy_weights = [0.3, 0.25, 0.25, 0.2]
+        
+        if self.learning_cycles < 10:
+            strategy_weights = [0.4, 0.2, 0.2, 0.2]
+        elif self.learning_cycles > 50:
+            strategy_weights = [0.2, 0.3, 0.3, 0.2]
+            
+        strategy = np.random.choice(
+            ['concept_exploration', 'knowledge_integration', 'practical_application', 'meta_cognitive'],
+            p=strategy_weights
+        )
+        
+        if strategy == 'concept_exploration' and self.knowledge_graph.nodes():
+            return self.generate_concept_exploration_question()
+        elif strategy == 'knowledge_integration' and len(self.knowledge_graph.nodes()) > 5:
+            return self.generate_integration_question()
+        elif strategy == 'practical_application':
+            return self.generate_practical_question()
+        else:
+            return self.generate_meta_cognitive_question()
+
+    def generate_concept_exploration_question(self) -> str:
+        """Generate questions about specific concepts"""
+        concepts = list(self.knowledge_graph.nodes())
+        
+        concept_weights = []
+        for concept in concepts:
+            degree = self.knowledge_graph.degree(concept)
+            weight = 1.0 / (degree + 1)
+            concept_weights.append(weight)
+            
+        concept_weights = np.array(concept_weights)
+        if concept_weights.sum() > 0:
+            concept_weights = concept_weights / concept_weights.sum()
+        else:
+            concept_weights = np.ones(len(concepts)) / len(concepts)
+            
+        concept = np.random.choice(concepts, p=concept_weights)
+        
+        question_types = [
+            f"What are the fundamental principles of {concept}?",
+            f"How does {concept} relate to other concepts I know?",
+            f"What are practical applications of {concept}?",
+            f"What are the limitations or boundaries of {concept}?",
+            f"How has the understanding of {concept} evolved over time?"
+        ]
+        
+        return random.choice(question_types)
+
+    def generate_integration_question(self) -> str:
+        """Generate questions that integrate multiple concepts"""
+        if len(self.knowledge_graph.nodes()) > 10:
+            try:
+                centrality = nx.betweenness_centrality(self.knowledge_graph)
+                bridge_concepts = sorted(centrality.items(), key=lambda x: x[1], reverse=True)[:5]
+                concept1 = random.choice(bridge_concepts)[0]
+                
+                neighbors = list(self.knowledge_graph.neighbors(concept1))
+                if neighbors:
+                    concept2 = random.choice(neighbors)
+                    return f"How do {concept1} and {concept2} interact or relate to each other?"
+            except:
+                pass
+                
+        concepts = random.sample(list(self.knowledge_graph.nodes()), 2)
+        return f"What is the relationship between {concepts[0]} and {concepts[1]}?"
+
+    def generate_practical_question(self) -> str:
+        """Generate practical application questions"""
+        practical_topics = [
+            "problem solving", "decision making", "optimization",
+            "efficiency", "innovation", "design thinking", "systems thinking"
+        ]
+        
+        topic = random.choice(practical_topics)
+        return f"How can I apply {topic} to real-world challenges?"
+
+    def generate_meta_cognitive_question(self) -> str:
+        """Generate meta-cognitive questions about learning itself"""
+        meta_questions = [
+            "How can I improve my learning process?",
+            "What cognitive biases might affect my understanding?",
+            "How do I know when I truly understand a concept?",
+            "What strategies are most effective for integrating new knowledge?",
+            "How can I balance exploration of new ideas with deepening existing knowledge?"
+        ]
+        
+        return random.choice(meta_questions)
+
+    def generate_dynamic_goals(self) -> List[str]:
+        """Generate learning goals based on knowledge gaps"""
+        goals = []
+        # Analyze knowledge graph for weak nodes
+        for node in self.knowledge_graph.nodes():
+            confidence = self.knowledge_graph.nodes[node].get('confidence', 0)
+            if confidence < 0.3:
+                goals.append(f"Improve understanding of {node}")
+        # Check for isolated nodes (poor connectivity)
+        for node in self.knowledge_graph.nodes():
+            if self.knowledge_graph.degree(node) < 2:
+                goals.append(f"Connect {node} to other concepts")
+        return goals
+
+    def cluster_knowledge(self):
+        """Perform unsupervised clustering of knowledge concepts"""
+        # Get concept embeddings
+        concepts = list(self.knowledge_graph.nodes())
+        if len(concepts) < 2:
+            return
+        concept_embeddings = [self.embedding_model.encode(concept) for concept in concepts]
+        X = np.array(concept_embeddings)
+        
+        # Reduce dimensionality for clustering
+        tsne = TSNE(n_components=2, random_state=42)
+        X_tsne = tsne.fit_transform(X)
+        
+        # Cluster using DBSCAN (for unknown number of clusters)
+        clustering = DBSCAN(eps=0.5, min_samples=2).fit(X_tsne)
+        labels = clustering.labels_
+        
+        # Update knowledge graph with clusters
+        for concept, label in zip(concepts, labels):
+            self.knowledge_graph.nodes[concept]['cluster'] = label
+        
+        # Identify anomalies (outliers)
+        anomalies = [concept for concept, label in zip(concepts, labels) if label == -1]
+        for anomaly in anomalies:
+            logger.info(f"Anomaly detected: {anomaly}")
+            # Generate a goal to explore anomalies
+            self.current_goals.append(f"Investigate anomaly: {anomaly}")
+
+    async def perform_web_research(self, question: str) -> List[str]:
+        """Perform web research on a question and return findings"""
+        if not self.web_engine or not self.web_research_enabled:
+            return []
+            
+        try:
+            concepts = self.extract_concepts_enhanced(question)
+            if not concepts:
+                return []
+                
+            research_results = []
+            for concept in concepts[:2]:
+                results = await self.web_engine.research_topic(concept)
+                research_results.extend(results)
+                
+            return research_results
+        except Exception as e:
+            logger.error(f"Web research failed: {e}")
+            return []
+
+    async def autonomous_learning_cycle(self) -> bool:
+        """Run one cycle of autonomous learning with memory management"""
+        self.check_memory_usage()
+        try:
+            # Use RL to choose action
+            state = self.env.get_state()
+            action = self.rl_agent.act(state)
+            next_state, reward, done, _, _ = self.env.step(action)
+            self.rl_agent.remember(state, action, reward, next_state, done)
+            self.rl_agent.replay(self.batch_size)
+            
+            # Periodically generate and pursue goals
+            if self.learning_cycles % 10 == 0:
+                goals = self.generate_dynamic_goals()
+                if goals:
+                    goal = random.choice(goals)
+                    # Pursue this goal by generating related questions
+                    question = f"How can I {goal}?"
+                    thought = self.generate_thought_for_question(question)
+                    concepts = self.extract_concepts_enhanced(thought)
+                    self.update_knowledge_graph(concepts, f"Goal: {goal}\nA: {thought}", "autonomous_goal")
+            
+            # Periodically perform unsupervised learning
+            if self.learning_cycles % 20 == 0:
+                self.cluster_knowledge()
+            
+            self.learning_cycles += 1
+            
+            if self.learning_cycles % 100 == 0:
+                logger.info(f"Autonomous learning cycle {self.learning_cycles}, reward: {reward}")
+            
+            if self.learning_cycles % 10 == 0:
+                self.cleanup_memory()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Autonomous learning cycle failed: {e}")
+            return False
+
+    def cleanup_memory(self):
+        """Clean up memory to prevent excessive growth"""
+        if (self.semantic_memory_embeddings is not None and
+            hasattr(self.semantic_memory_embeddings, 'shape') and
+            self.semantic_memory_embeddings.shape[0] > self.max_memory_size * 1.5):
+            self.semantic_memory_embeddings = None
+            self.memory_dirty = True
+            
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    def _init_web_engine(self):
+        """Initialize the web research engine in a separate thread"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def setup():
+            try:
+                await self.web_engine.initialize()
+            except Exception as e:
+                logger.error(f"Web engine initialization failed: {e}")
+                self.web_research_enabled = False
+                
+        try:
+            loop.run_until_complete(setup())
+        except Exception as e:
+            logger.error(f"Web engine setup failed: {e}")
+            self.web_research_enabled = False
+            
+        # Only continue if web research is still enabled
+        if self.web_research_enabled:
+            try:
+                # Run the event loop until stop_web_engine is True
+                async def run_loop():
+                    while not self.stop_web_engine:
+                        await asyncio.sleep(1)
+                        
+                loop.run_until_complete(run_loop())
+            except Exception as e:
+                logger.error(f"Web engine loop failed: {e}")
+            
+            try:
+                loop.run_until_complete(self.web_engine.shutdown())
+            except Exception as e:
+                logger.error(f"Web engine shutdown failed: {e}")
+        loop.close()
+
+    async def autonomous_learning_loop(self):
+        """Background autonomous learning loop"""
+        while not self.stop_autonomous_learning:
+            try:
+                await self.autonomous_learning_cycle()
+                sleep_time = random.randint(
+                    self.autonomous_interval_min,
+                    self.autonomous_interval_max
+                )
+                await asyncio.sleep(sleep_time)
+                
+                if time.time() - self.last_save_time > self.save_interval:
+                    self.save_state()
+                    
+            except Exception as e:
+                logger.error(f"Error in autonomous learning loop: {e}")
+                await asyncio.sleep(30)
+
+    def start_autonomous_learning(self):
+        """Start the autonomous learning thread"""
+        self.stop_autonomous_learning = False
+        self.autonomous_thread = threading.Thread(
+            target=lambda: asyncio.run(self.autonomous_learning_loop())
+        )
+        self.autonomous_thread.daemon = True
+        self.autonomous_thread.start()
+        logger.info("Autonomous learning thread started")
+
+    def stop_autonomous_learning_thread(self):
+        """Stop the autonomous learning thread"""
+        self.stop_autonomous_learning = True
+        if self.autonomous_thread:
+            self.autonomous_thread.join(timeout=5.0)
+        logger.info("Autonomous learning thread stopped")
+
+    def stop_web_engine_thread(self):
+        """Stop the web engine thread"""
+        self.stop_web_engine = True
+        if hasattr(self, 'web_thread') and self.web_thread:
+            self.web_thread.join(timeout=5.0)
+        logger.info("Web engine thread stopped")
+
+    def process_user_question(self, question: str) -> str:
+        """Process a user question and generate a thoughtful response"""
+        # Store user question for follow-up learning
+        self.recent_questions.append(question)
+        
+        relevant_context = self.semantic_memory_search(question, top_k=3)
+        context_str = ""
+        if relevant_context:
+            context_str = " ".join(relevant_context)
+        
+        prompt = f"""Based on the following context, please answer the question:
+
+Context: {context_str}
+
+Question: {question}
+
+Answer:"""
+        
+        try:
+            response = self.medium_pipe(
+                prompt,
+                max_new_tokens=300,
+                temperature=0.7,
+                do_sample=True,
+            )
+            
+            answer = response[0]['generated_text'].replace(prompt, "").strip()
+            
+            concepts = self.extract_concepts_enhanced(answer)
+            self.update_knowledge_graph(concepts, f"Q: {question}\nA: {answer}", "user")
+            
+            memory_entry = f"USER_Q: {question} USER_A: {answer}"
+            self.semantic_memory.append(memory_entry)
+            self.memory_dirty = True
+            
+            self.learning_cycles += 1
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            return f"I apologize, but I encountered an error while generating an answer: {str(e)}"
+
+    def run_auto_recursive_learning(self):
+        """Automatically run the recursive learning question multiple times"""
+        print("\n" + "="*60)
+        print("STARTING AUTOMATED RECURSIVE LEARNING PROCESS")
+        print(f"Running {self.auto_learn_cycles} cycles of meta-cognitive questioning")
+        print("="*60)
+        
+        core_question = "What is the most important context I should consider when answering your questions?"
+        
+        for cycle in range(self.auto_learn_cycles):
+            print(f"\n--- Recursive Learning Cycle {cycle+1}/{self.auto_learn_cycles} ---")
+            print(f"Q: {core_question}")
+            
+            # Process the question and generate an answer
+            answer = self.process_user_question(core_question)
+            print(f"A: {answer}")
+            
+            # Extract concepts and update knowledge graph
+            concepts = self.extract_concepts_enhanced(answer)
+            self.update_knowledge_graph(concepts, f"Q: {core_question}\nA: {answer}", "recursive_auto")
+            
+            # Add to semantic memory
+            memory_entry = f"RECURSIVE_Q: {core_question}\nRECURSIVE_A: {answer}"
+            self.semantic_memory.append(memory_entry)
+            self.memory_dirty = True
+            
+            self.learning_cycles += 1
+            
+            # Small delay between cycles
+            time.sleep(2)
+        
+        print("\n" + "="*60)
+        print("AUTOMATED RECURSIVE LEARNING COMPLETE")
+        print(f"Completed {self.auto_learn_cycles} cycles of meta-cognitive refinement")
+        print("="*60)
+
+    def save_state(self):
+        """Save system state with better error handling"""
+        try:
+            with open(self.archive_dir / "semantic_memory.json", "w") as f:
+                json.dump(list(self.semantic_memory), f, indent=2, cls=NumpyEncoder)
+            
+            graph_data = {
+                "nodes": [
+                    {"id": node, "data": dict(self.knowledge_graph.nodes[node])}
+                    for node in self.knowledge_graph.nodes()
+                ],
+                "edges": [
+                    {"source": u, "target": v, "data": dict(self.knowledge_graph[u][v])}
+                    for u, v in self.knowledge_graph.edges()
+                ]
+            }
+            with open(self.archive_dir / "knowledge_graph.json", "w") as f:
+                json.dump(graph_data, f, indent=2, cls=NumpyEncoder)
+            
+            with open(self.archive_dir / "concept_quality.json", "w") as f:
+                json.dump(dict(self.concept_quality), f, indent=2, cls=NumpyEncoder)
+            
+            # Save RL agent state
+            torch.save({
+                'model_state_dict': self.rl_agent.model.state_dict(),
+                'optimizer_state_dict': self.rl_agent.optimizer.state_dict(),
+                'epsilon': self.rl_agent.epsilon,
+            }, self.archive_dir / "rl_agent.pt")
+            
+            state = {
+                "learning_cycles": int(self.learning_cycles),
+                "concept_count": int(self.concept_count),
+                "learning_objectives": self.learning_objectives,
+                "current_focus": self.current_focus,
+                "timestamp": datetime.now().isoformat()
+            }
+            with open(self.archive_dir / "learning_state.json", "w") as f:
+                json.dump(state, f, indent=2, cls=NumpyEncoder)
+            
+            with open(self.archive_dir / "config.yaml", "w") as f:
+                yaml.dump(self.config.config, f)
+            
+            self.last_save_time = time.time()
+            logger.info(f"State saved at cycle {self.learning_cycles}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def load_state(self):
+        """Load system state with better error handling"""
+        try:
+            memory_file = self.archive_dir / "semantic_memory.json"
+            if memory_file.exists():
+                with open(memory_file, "r") as f:
+                    memory_data = json.load(f)
+                    self.semantic_memory = deque(memory_data, maxlen=self.max_memory_size)
+            
+            graph_file = self.archive_dir / "knowledge_graph.json"
+            if graph_file.exists():
+                with open(graph_file, "r") as f:
+                    graph_data = json.load(f)
+                    self.knowledge_graph = nx.DiGraph()
+                    
+                    for node in graph_data.get("nodes", []):
+                        self.knowledge_graph.add_node(node["id"], **node["data"])
+                    
+                    for edge in graph_data.get("edges", []):
+                        self.knowledge_graph.add_edge(
+                            edge["source"], edge["target"], **edge["data"]
+                        )
+            
+            quality_file = self.archive_dir / "concept_quality.json"
+            if quality_file.exists():
+                with open(quality_file, "r") as f:
+                    self.concept_quality = defaultdict(lambda: {'confidence': 0.5, 'sources': []},
+                                                     json.load(f))
+            
+            # Load RL agent state
+            rl_file = self.archive_dir / "rl_agent.pt"
+            if rl_file.exists():
+                checkpoint = torch.load(rl_file)
+                self.rl_agent.model.load_state_dict(checkpoint['model_state_dict'])
+                self.rl_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.rl_agent.epsilon = checkpoint['epsilon']
+            
+            state_file = self.archive_dir / "learning_state.json"
+            if state_file.exists():
+                with open(state_file, "r") as f:
+                    state_data = json.load(f)
+                    self.learning_cycles = state_data.get("learning_cycles", 0)
+                    self.concept_count = state_data.get('concept_count', 0)
+                    self.learning_objectives = state_data.get('learning_objectives', [])
+                    self.current_focus = state_data.get('current_focus', None)
+            
+            logger.info(f"State loaded: {self.learning_cycles} cycles, {self.concept_count} concepts")
+            
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+
+    def get_status_report(self) -> Dict:
+        """Generate a status report of the system"""
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024
+        
+        avg_confidence = 0
+        if self.concept_quality:
+            confidences = [q['confidence'] for q in self.concept_quality.values()]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+        
+        return {
+            "learning_cycles": self.learning_cycles,
+            "concept_count": self.concept_count,
+            "semantic_memory_size": len(self.semantic_memory),
+            "knowledge_graph_nodes": len(self.knowledge_graph.nodes()),
+            "knowledge_graph_edges": len(self.knowledge_graph.edges()),
+            "average_confidence": f"{avg_confidence * 100:.1f}%",
+            "memory_usage_mb": f"{memory_usage:.1f}",
+            "current_focus": self.current_focus['id'] if self.current_focus else None,
+            "learning_objectives": [
+                {
+                    "id": obj['id'],
+                    "progress": f"{obj['progress']*100:.1f}%"
+                } for obj in self.learning_objectives
+            ],
+            "web_research_enabled": self.web_research_enabled,
+            "web_engine_status": "Active" if self.web_engine and not self.stop_web_engine else "Inactive",
+            "rl_epsilon": f"{self.rl_agent.epsilon:.3f}",
+            "current_goals": list(self.current_goals)
+        }
+
+    def visualize_knowledge_graph(self, filename: str = "knowledge_graph.png"):
+        """Visualize the knowledge graph"""
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(12, 12))
+            pos = nx.spring_layout(self.knowledge_graph, k=0.15, iterations=20)
+            
+            # Color nodes by cluster if available
+            if any('cluster' in self.knowledge_graph.nodes[n] for n in self.knowledge_graph.nodes()):
+                colors = [self.knowledge_graph.nodes[n].get('cluster', 0) for n in self.knowledge_graph.nodes()]
+                nx.draw(self.knowledge_graph, pos, node_color=colors, with_labels=True,
+                       cmap=plt.cm.Set3, edge_color='gray', font_size=8, node_size=500, alpha=0.8)
+            else:
+                nx.draw(self.knowledge_graph, pos, with_labels=True, node_color='skyblue',
+                       edge_color='gray', font_size=8, node_size=500, alpha=0.8)
+            
+            plt.title("Knowledge Graph")
+            plt.savefig(self.archive_dir / filename)
+            plt.close()
+            logger.info(f"Knowledge graph visualized and saved to {self.archive_dir / filename}")
+        except Exception as e:
+            logger.error(f"Failed to visualize knowledge graph: {e}")
+
+    def configure_api_keys(self):
+        """Allow user to configure API keys"""
+        print("\nAPI Key Configuration")
+        print("====================")
+        
+        # News API
+        current_news_key = self.config.get('web.news_api_key', '')
+        if current_news_key:
+            print(f"Current News API key: {current_news_key[:4]}...{current_news_key[-4:]}")
+        else:
+            print("No News API key configured")
+        
+        response = input("Enter new News API key (or press Enter to keep current): ").strip()
+        if response:
+            self.config.update_api_key("news", response, self.archive_dir)
+            print("News API key updated successfully")
+        
+        # OpenWeatherMap API (optional)
+        current_weather_key = self.config.get('web.openweathermap_api_key', '')
+        if current_weather_key:
+            print(f"Current OpenWeatherMap API key: {current_weather_key[:4]}...{current_weather_key[-4:]}")
+        else:
+            print("No OpenWeatherMap API key configured")
+        
+        response = input("Enter OpenWeatherMap API key (or press Enter to skip): ").strip()
+        if response:
+            self.config.update_api_key("openweathermap", response, self.archive_dir)
+            print("OpenWeatherMap API key updated successfully")
+        
+        # CurrencyFreaks API (optional)
+        current_currency_key = self.config.get('web.currencyfreaks_api_key', '')
+        if current_currency_key:
+            print(f"Current CurrencyFreaks API key: {current_currency_key[:4]}...{current_currency_key[-4:]}")
+        else:
+            print("No CurrencyFreaks API key configured")
+        
+        response = input("Enter CurrencyFreaks API key (or press Enter to skip): ").strip()
+        if response:
+            self.config.update_api_key("currencyfreaks", response, self.archive_dir)
+            print("CurrencyFreaks API key updated successfully")
+        
+        print("API configuration complete")
+
+def main():
+    """Main function for interactive user interface"""
+    print("Initializing Interactive Learning System...")
+    
+    config_path = "./config.yaml"
+    if Path(config_path).exists():
+        config = Config(config_path)
+        print(f"Loaded configuration from {config_path}")
+    else:
+        config = Config()
+        print("Using default configuration")
+    
+    # Check if batch mode is enabled via command line argument
+    if len(sys.argv) > 1 and sys.argv[1] == "batch":
+        # Batch processing mode with autonomous learning enabled
+        autonomous_enabled = True
+        web_research_enabled = True
+        config.config['system']['autonomous_learning'] = autonomous_enabled
+        config.config['system']['web_research_enabled'] = web_research_enabled
+        
+        system = InteractiveLearningSystem(config)
+        
+        try:
+            system.load_state()
+        except Exception as e:
+            print(f"Could not load previous state: {e}")
+        
+        question = "What is the most important context I should consider when answering your questions?"
+        num_loops = 90000
+        
+        print(f"Starting batch processing of '{question}' {num_loops} times...")
+        
+        for i in range(num_loops):
+            if i % 1000 == 0:
+                print(f"Processing iteration {i}")
+            answer = system.process_user_question(question)
+        
+        print("Batch processing complete. Saving state...")
+        system.save_state()
+        print("State saved. Exiting.")
+    
+    else:
+        # Interactive mode
+        autonomous_enabled = input("Enable autonomous learning in background? (y/n): ").lower().startswith('y')
+        config.config['system']['autonomous_learning'] = autonomous_enabled
+        
+        web_research_enabled = input("Enable web research capabilities? (y/n): ").lower().startswith('y')
+        config.config['system']['web_research_enabled'] = web_research_enabled
+        
+        system = InteractiveLearningSystem(config)
+        
+        # API configuration
+        configure_apis = input("Configure API keys now? (y/n): ").lower().startswith('y')
+        if configure_apis:
+            system.configure_api_keys()
+        
+        try:
+            system.load_state()
+        except Exception as e:
+            print(f"Could not load previous state: {e}")
+        
+        print("\n" + "="*60)
+        print("Interactive Learning System Ready!")
+        print("Type your questions or type 'exit' to quit")
+        print("Type 'status' to see system status")
+        print("Type 'config' to see current configuration")
+        print("Type 'visualize' to generate a knowledge graph visualization")
+        print("Type 'api' to configure API keys")
+        if autonomous_enabled:
+            print("Autonomous learning is running in the background")
+        if web_research_enabled:
+            print("Web research capabilities are enabled")
+        print("="*60)
+        
+        while True:
+            try:
+                user_input = input("\nYou: ").strip()
+                
+                if user_input.lower() in ['exit', 'quit', 'bye']:
+                    print("Saving state and exiting...")
+                    system.stop_autonomous_learning_thread()
+                    system.stop_web_engine_thread()
+                    system.save_state()
+                    break
+                    
+                elif user_input.lower() in ['status', 'stats', 'info']:
+                    status = system.get_status_report()
+                    print("\nSystem Status:")
+                    print(f"Learning cycles: {status['learning_cycles']}")
+                    print(f"Concepts learned: {status['concept_count']}")
+                    print(f"Knowledge graph: {status['knowledge_graph_nodes']} nodes, {status['knowledge_graph_edges']} edges")
+                    print(f"Semantic memory: {status['semantic_memory']} entries")
+                    print(f"Average concept confidence: {status['average_confidence']}")
+                    print(f"Memory usage: {status['memory_usage_mb']} MB")
+                    print(f"RL exploration rate: {status['rl_epsilon']}")
+                    if status['current_focus']:
+                        print(f"Current focus: {status['current_focus']}")
+                    if status['web_research_enabled']:
+                        print(f"Web research: {status['web_engine_status']}")
+                    if status['current_goals']:
+                        print("Current goals:")
+                        for goal in status['current_goals']:
+                            print(f"  - {goal}")
+                    continue
+                    
+                elif user_input.lower() in ['config', 'settings']:
+                    print("\nCurrent Configuration:")
+                    for key, value in config.config.items():
+                        if isinstance(value, dict):
+                            print(f"{key}:")
+                            for k, v in value.items():
+                                print(f"  {k}: {v}")
+                        else:
+                            print(f"{key}: {value}")
+                    continue
+                    
+                elif user_input.lower() in ['visualize', 'graph']:
+                    print("Generating knowledge graph visualization...")
+                    system.visualize_knowledge_graph()
+                    print(f"Knowledge graph saved to {system.archive_dir / 'knowledge_graph.png'}")
+                    continue
+                    
+                elif user_input.lower() in ['api', 'apikey', 'keys']:
+                    system.configure_api_keys()
+                    continue
+                    
+                elif not user_input:
+                    continue
+                    
+                print("Thinking...", end="", flush=True)
+                start_time = time.time()
+                
+                answer = system.process_user_question(user_input)
+                
+                response_time = time.time() - start_time
+                print(f"\rAI: {answer}")
+                print(f"(Response time: {response_time:.2f}s)")
+                
+            except KeyboardInterrupt:
+                print("\n\nInterrupted by user. Saving state...")
+                system.stop_autonomous_learning_thread()
+                system.stop_web_engine_thread()
+                system.save_state()
+                break
+            except Exception as e:
+                print(f"\nAn error occurred: {e}")
+                logger.error(f"Error in main loop: {traceback.format_exc()}")
+
+if __name__ == "__main__":
+    main()
