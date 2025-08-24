@@ -145,3 +145,6 @@ Most of the system's logic and quirkiness comes from a mix of autonomous learnin
 ---
 
 Enjoy exploring, learning, and interacting with your AI learning buddy!
+
+The bug needs fixing to use. 
+inplace intentionally.
